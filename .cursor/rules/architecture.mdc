@@ -1,0 +1,36 @@
+---
+alwaysApply: true
+---
+System Architecture
+
+Data Flow
+
+File Upload:
+
+User uploads IFC to SvelteKit Client.
+
+Client uploads directly to Supabase Storage (S3) via Signed URL (avoids server bottleneck).
+
+Client notifies Backend (FastAPI) via API: "New file at path X".
+
+Processing:
+
+FastAPI downloads file from Storage.
+
+Runs analysis/simulation using ifcopenshell or thatopen python wrappers.
+
+Stores results in Supabase Database (JSONB).
+
+Viewing:
+
+Viewer requests Model URL.
+
+Downloads WASM/Fragment chunks.
+
+Renders locally on Client GPU.
+
+Security
+
+Auth: Supabase Auth (JWT). Pass JWT to FastAPI in Authorization header.
+
+RLS: Enable Row Level Security on Supabase. Users can only see their own projects.

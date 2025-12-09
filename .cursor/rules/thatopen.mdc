@@ -1,0 +1,43 @@
+---
+description: thatopen framework guidelines
+alwaysApply: false
+---
+ThatOpen Framework Guidelines (BIM Engine)
+
+Core Principles
+
+The application uses @thatopen/components (Engine) and @thatopen/ui (Web Components).
+
+1. Lifecycle Management (CRITICAL)
+
+Initialization: Always initialize the viewer inside onMount (Svelte). The 3D context does not exist during SSR (Server Side Rendering).
+
+Disposal: You MUST implement a dispose() or cleanup function in onDestroy.
+
+Call components.dispose().
+
+Remove event listeners.
+
+Nullify references to avoid memory leaks (WebGL contexts are heavy).
+
+2. UI Integration
+
+Web Components: Use @thatopen/ui tags directly in Svelte HTML (e.g., <bim-viewport>, <bim-grid>).
+
+Bindings: To interact with UI components via code, use bind:this.
+
+Styling: Do not try to style <bim-*> components with global CSS. Use their exposed CSS variables or the BUI.Manager API.
+
+3. Data Handling
+
+WASM: Configure the IfcLoader to point to a valid CDN or local static asset folder for web-ifc.wasm.
+
+Fragments: Always convert IFC to Fragments for display. Do not try to render raw IFC geometry with Three.js primitives manually.
+
+Coordinate System: Always ensure COORDINATE_TO_ORIGIN = true in loader settings to prevent floating point jitter. Implement "Global Shift" logic to align multiple models (Arch + Structural).
+
+4. Error Patterns to Avoid
+
+SSR Error: "window is not defined". -> Fix: Wrap viewer logic in if (browser) { ... } or onMount.
+
+Context Lost: "WebGL context lost". -> Fix: Ensure only ONE instance of the viewer exists per page.

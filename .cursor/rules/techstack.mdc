@@ -1,0 +1,50 @@
+---
+alwaysApply: true
+---
+Tech Stack Guidelines
+
+Frontend: SvelteKit + Skeleton UI
+
+Svelte Components:
+
+Use <script lang="ts">.
+
+Use bind:this={element} instead of document.getElementById().
+
+Use Svelte Stores for global state (User session, current Model ID).
+
+Components must be reactive. Avoid direct DOM manipulation outside of onMount.
+
+Styling:
+
+Use Tailwind CSS utility classes.
+
+Use Skeleton UI components (AppBar, AppShell) for layout structure.
+
+Keep CSS in <style> blocks only for specific 3D-Canvas overlays that Tailwind cannot reach easily.
+
+Data Fetching:
+
+Use SvelteKit load functions in +page.server.ts for initial data.
+
+Use standard fetch or a typed wrapper for API calls to the FastAPI backend.
+
+Backend: FastAPI (Python)
+
+Structure:
+
+Modular router structure (/api/v1/simulation, /api/v1/files).
+
+Use Dependency Injection (Depends) for Database sessions and Auth.
+
+Typing:
+
+STRICT use of Pydantic models for Request/Response schemas.
+
+Type hint every function argument and return value.
+
+Async:
+
+All I/O bound operations (DB, S3 download) must be async def.
+
+Heavy computations (Simulation) must run in BackgroundTasks or a Celery worker to not block the main loop.
