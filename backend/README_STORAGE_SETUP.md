@@ -50,3 +50,4 @@ uvicorn main:app --reload
 
 Der Upload sollte jetzt funktionieren, wenn der `bim-files` Bucket in Supabase existiert.
 
+

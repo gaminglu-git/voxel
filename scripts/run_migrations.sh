@@ -31,3 +31,4 @@ supabase db push
 
 echo "✅ Migrationen erfolgreich ausgeführt!"
 
+

@@ -105,3 +105,4 @@ SUPABASE_KEY=your-service-role-key
 SUPABASE_JWT_SECRET=your-jwt-secret  # Optional, für Token-Validierung
 ```
 
+

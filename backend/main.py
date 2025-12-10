@@ -286,7 +286,6 @@ async def analyze_ifc_file(request: AnalyzeRequest):
     bucket_name = "bim-files"
     file_path = request.file_path
     tmp_path = None  # Initialize tmp_path to None
-    ifc_file = None  # Initialize ifc_file to None
 
     try:
         # Create a temporary file that will be deleted automatically on close
@@ -300,15 +299,15 @@ async def analyze_ifc_file(request: AnalyzeRequest):
             os.fsync(tmp.fileno())
 
         # Now that the file is written and closed, open it with ifcopenshell
+        # Note: ifcopenshell.open() returns a file object that doesn't need explicit closing
+        # The file is automatically managed by ifcopenshell
         ifc_file = ifcopenshell.open(tmp_path)
         
         # Perform a simple analysis: count all walls
         walls = ifc_file.by_type("IfcWall")
         wall_count = len(walls)
         
-        # Close the IFC file to free resources
-        ifc_file.close()
-        ifc_file = None
+        # No need to close ifc_file - it's automatically managed by ifcopenshell
         
         return {"wall_count": wall_count}
         
@@ -325,12 +324,6 @@ async def analyze_ifc_file(request: AnalyzeRequest):
         )
     
     finally:
-        # Ensure the IFC file is closed if it was opened
-        if ifc_file is not None:
-            try:
-                ifc_file.close()
-            except Exception:
-                pass  # Ignore errors during cleanup
         # Ensure the temporary file is cleaned up in any case
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)

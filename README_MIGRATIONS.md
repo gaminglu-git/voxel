@@ -49,3 +49,4 @@ supabase migration new <migration_name>
 
 - `20241209140000_create_projects_permissions.sql` - Erstellt Projects, Teams, Companies und Permission Management
 
+

@@ -163,3 +163,4 @@ CREATE POLICY "Users can delete own scenes"
     FOR DELETE
     USING (auth.uid() = user_id);
 
+

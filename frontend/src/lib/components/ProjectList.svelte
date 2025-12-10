@@ -57,6 +57,20 @@
   }
 
   function selectProject(project: Project) {
+    // Validate project data before constructing URL
+    if (!project.file_path) {
+      console.error('Project file_path is missing:', project);
+      error = `Projekt "${project.name}" hat keinen gültigen Dateipfad.`;
+      return;
+    }
+    
+    // Validate SUPABASE_URL is set
+    if (!SUPABASE_URL) {
+      console.error('VITE_SUPABASE_URL is not set in environment variables');
+      error = 'Supabase URL ist nicht konfiguriert. Bitte setzen Sie VITE_SUPABASE_URL in der .env Datei.';
+      return;
+    }
+    
     // Construct download URL - try public first, will fallback to signed URL in viewer
     const url = `${SUPABASE_URL}/storage/v1/object/public/bim-files/${project.file_path}`;
     onSelect?.({ url, projectId: project.id });

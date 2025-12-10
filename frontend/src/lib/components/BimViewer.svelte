@@ -8,10 +8,6 @@
     import { post } from '$lib/services/api';
     import type { MarketplaceItem } from './Marketplace.svelte';
     
-    // Import web-ifc directly to configure WASM path before ThatOpen Components loads it
-    // This prevents version mismatches that cause "callbacks.shift() is not a function" errors
-    let webIfc: any = null;
-    
     // FragmentLoader import - CommonJS module workaround
     // Will be loaded dynamically in browser only when needed
     let FragmentLoader: any = null;
@@ -42,9 +38,13 @@
       categoryId?: string; // Reference to IFC Category
     };
     
-    let treeData = $state<TreeItem[]>([]);
-    let properties = $state<Record<string, any> | null>(null);
-    let activeTool = $state<'select' | 'measure' | 'clip'>('select');
+let treeData = $state<TreeItem[]>([]);
+let properties = $state<Record<string, any> | null>(null);
+let activeTool = $state<'select' | 'measure' | 'clip'>('select');
+let lastLoadedUrl: string | null = null;
+let loadToken = 0;
+let pendingLoad: { url: string; token: number } | null = null;
+let isProcessingLoad = false;
     
     // --- Engine State ---
     let components: OBC.Components;
@@ -72,15 +72,15 @@
     
     let sceneModel = $state<SceneModelItem[]>([]);
     let fragmentLoader: any = null;
-    let transformControls: TransformControls | null = null;
-    let selectedInstance: THREE.Object3D | null = null;
+let transformControls: TransformControls | null = null;
+let selectedInstance: THREE.Object3D | null = null;
   
-    $effect(() => {
-      if (modelUrl && loader && engineInitialized) {
-        loadModelFromUrl(modelUrl);
-      }
-    });
-  
+$effect(() => {
+  if (!modelUrl || !loader || !engineInitialized) return;
+  if (modelUrl === lastLoadedUrl) return;
+  enqueueModelLoad(modelUrl);
+});
+
     onMount(async () => {
       if (!browser) return;
       await initEngine();
@@ -95,9 +95,30 @@
         world.scene.three.remove(transformControls);
         transformControls.dispose();
       }
-      if (components) components.dispose();
-    });
-  
+  if (components) components.dispose();
+});
+
+function enqueueModelLoad(url: string) {
+  const token = ++loadToken;
+  pendingLoad = { url, token };
+  if (isProcessingLoad) return;
+  isProcessingLoad = true;
+  (async () => {
+    while (pendingLoad) {
+      const next = pendingLoad;
+      pendingLoad = null;
+      try {
+        await loadModelFromUrl(next.url, next.token);
+        lastLoadedUrl = next.url;
+      } catch (err) {
+        console.error('Model load failed:', err);
+        loadingText = `Fehler beim Laden: ${err instanceof Error ? err.message : 'Unbekannter Fehler'}`;
+      }
+    }
+  })().finally(() => {
+    isProcessingLoad = false;
+  });
+}
     async function initEngine() {
       components = new OBC.Components();
       const worlds = components.get(OBC.Worlds);
@@ -128,13 +149,71 @@
   
       // Loader Config
       fragments = components.get(OBC.FragmentsManager);
-      // Initialize FragmentsManager if needed
+      // Initialize FragmentsManager with worker URL (required for performance)
+      // Use local worker to avoid CORS issues
       if (fragments && typeof (fragments as any).init === 'function') {
         try {
-          (fragments as any).init();
-          console.log('FragmentsManager initialized');
+          // Use local worker URL to avoid CORS errors
+          const workerUrl = new URL('/workers/worker.mjs', window.location.origin).href;
+          (fragments as any).init(workerUrl);
+          console.log('FragmentsManager initialized with local worker:', workerUrl);
+          
+          // Setup camera controls listener for fragment updates
+          if (world.camera.controls) {
+            world.camera.controls.addEventListener("rest", () => {
+              if (fragments && (fragments as any).core) {
+                (fragments as any).core.update(true);
+              }
+            });
+          }
+          
+          // Ensure fragments model uses camera and is added to scene
+          if (fragments.list && fragments.list.onItemSet) {
+            fragments.list.onItemSet.add(({ value: model }: any) => {
+              if (model && model.useCamera && world.camera) {
+                model.useCamera(world.camera.three);
+              }
+              if (model && model.object && world.scene) {
+                world.scene.three.add(model.object);
+              }
+              if (fragments && (fragments as any).core) {
+                (fragments as any).core.update(true);
+              }
+            });
+          }
         } catch (fragInitError) {
-          console.warn('FragmentsManager init failed (may not be required):', fragInitError);
+          console.warn('FragmentsManager init with worker failed, falling back to single-threaded mode:', fragInitError);
+          try {
+            // Fallback to single-threaded mode (no worker)
+            (fragments as any).init();
+            console.log('FragmentsManager initialized in single-threaded mode (no worker)');
+            
+            // Setup camera controls listener for fragment updates
+            if (world.camera.controls) {
+              world.camera.controls.addEventListener("rest", () => {
+                if (fragments && (fragments as any).core) {
+                  (fragments as any).core.update(true);
+                }
+              });
+            }
+            
+            // Ensure fragments model uses camera and is added to scene
+            if (fragments.list && fragments.list.onItemSet) {
+              fragments.list.onItemSet.add(({ value: model }: any) => {
+                if (model && model.useCamera && world.camera) {
+                  model.useCamera(world.camera.three);
+                }
+                if (model && model.object && world.scene) {
+                  world.scene.three.add(model.object);
+                }
+                if (fragments && (fragments as any).core) {
+                  (fragments as any).core.update(true);
+                }
+              });
+            }
+          } catch (fallbackError) {
+            console.error('FragmentsManager init failed completely:', fallbackError);
+          }
         }
       }
       
@@ -143,112 +222,131 @@
     
     // Use local WASM files to ensure version consistency
     // This resolves "callbacks.shift is not a function" errors caused by version mismatches
-    let wasmPath = "/wasm/";
-    
-    // Set WASM path in loader settings
-    loader.settings.wasm = {
-        path: wasmPath,
-        absolute: true
-    };
-    
-    // DISABLE automatic WASM path detection to prevent overriding our local path
-    // This is critical because ThatOpen Components fetches its package.json and sets WASM to the peerDependency version
-    loader.settings.autoSetWasm = false;
-
-    // Configure web-ifc manually if needed
-    try {
-      const webIfcModule = await import('web-ifc');
-      webIfc = webIfcModule;
-      
-      if (webIfc && typeof webIfc.SetWasmPath === 'function') {
-        webIfc.SetWasmPath(wasmPath);
-      }
-    } catch (e) {
-      console.warn('Could not configure web-ifc directly:', e);
-    }
-    
-    console.log('WASM configuration:', {
-      path: loader.settings.wasm?.path,
-      absolute: loader.settings.wasm?.absolute,
-      expected: wasmPath
-    });
+    const wasmPath = "/wasm/";
     
     // Setup loader (this initializes WebAssembly)
+    // WASM configuration is passed directly in setup() call according to ThatOpen Components API
     console.log('Setting up IFC loader...');
     const setupStartTime = performance.now();
+    
     try {
-      // Pass config to setup to ensure autoSetWasm is disabled
-      await loader.setup({ autoSetWasm: false });
+      // Configure WASM path directly in setup() call
+      // setup() should wait until WASM is fully loaded
+      console.log('Calling loader.setup() with config:', {
+        autoSetWasm: false,
+        wasm: { path: wasmPath, absolute: true }
+      });
+      
+      const setupPromise = loader.setup({
+        autoSetWasm: false,
+        wasm: {
+          path: wasmPath,
+          absolute: true,
+        },
+      });
+      
+      // Add timeout to detect if setup() hangs
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        setTimeout(() => {
+          reject(new Error('Loader setup timeout after 10 seconds'));
+        }, 10000);
+      });
+      
+      await Promise.race([setupPromise, timeoutPromise]);
+      
       const setupDuration = ((performance.now() - setupStartTime) / 1000).toFixed(2);
-      console.log(`IFC loader setup complete in ${setupDuration}s`);
-        
-        // Verify WASM path AFTER setup (to catch any overrides)
-        const actualPath = loader.settings.wasm?.path;
-        console.log('WASM configuration (after setup):', {
-          path: actualPath,
-          absolute: loader.settings.wasm?.absolute,
-          expected: wasmPath,
-          matches: actualPath === wasmPath
-        });
-        
-        // Verify WASM path after setup - should match our configured version (0.0.72)
-        if (actualPath && actualPath !== wasmPath) {
-          console.warn('WASM path was changed during setup:', {
-            expected: wasmPath,
-            actual: actualPath,
-            note: 'This may cause issues if versions are incompatible'
-          });
-          // Update our reference to match what ThatOpen Components actually loaded
-          wasmPath = actualPath;
-        } else {
-          console.log('✅ WASM version matches expected version:', wasmPath);
-        }
-      } catch (setupError) {
-        console.error('Loader setup failed:', setupError);
-        throw new Error(`IFC Loader Setup fehlgeschlagen: ${setupError instanceof Error ? setupError.message : 'Unbekannter Fehler'}`);
-      }
+      console.log(`✅ IFC loader setup complete in ${setupDuration}s`);
       
       // Verify loader is ready after setup
-      if (!loader || !loader.settings || !loader.settings.webIfc) {
-        throw new Error('Loader ist nach Setup nicht korrekt initialisiert');
+      // Check both loader.webIfc (direct property) and loader.settings.webIfc
+      const webIfc = loader.webIfc || loader.settings?.webIfc;
+      if (!loader || !loader.settings || !webIfc) {
+        throw new Error('Loader ist nach Setup nicht korrekt initialisiert - webIfc nicht verfügbar');
       }
       
-      loader.settings.webIfc.COORDINATE_TO_ORIGIN = true;
+      console.log('✅ Loader initialized', {
+        hasWebIfc: !!webIfc,
+        webIfcType: webIfc?.constructor?.name,
+        hasSettings: !!loader.settings
+      });
+      
+      // Optional: Check if WASM file is accessible (for debugging)
+      try {
+        const wasmUrl = `${wasmPath}web-ifc.wasm`;
+        const wasmCheck = await fetch(wasmUrl, { method: 'HEAD' });
+        if (!wasmCheck.ok) {
+          console.warn(`⚠️ WASM file may not be accessible at ${wasmUrl} (Status: ${wasmCheck.status})`);
+        } else {
+          console.log(`✅ WASM file is accessible at ${wasmUrl}`);
+        }
+      } catch (wasmCheckError) {
+        console.warn('⚠️ Could not verify WASM file accessibility:', wasmCheckError);
+      }
+      
+    } catch (setupError) {
+      console.error('❌ Loader setup failed:', setupError);
+      console.error('Setup error details:', {
+        error: setupError,
+        message: setupError instanceof Error ? setupError.message : String(setupError),
+        stack: setupError instanceof Error ? setupError.stack : undefined,
+        wasmPath,
+        loaderExists: !!loader,
+        hasSettings: !!loader?.settings
+      });
+      
+      // Provide helpful error message
+      let errorMessage = 'IFC Loader Setup fehlgeschlagen';
+      if (setupError instanceof Error) {
+        errorMessage += `: ${setupError.message}`;
+        
+        // Check if it's a WASM-related error
+        if (setupError.message.toLowerCase().includes('wasm') || 
+            setupError.message.toLowerCase().includes('webassembly') ||
+            setupError.message.toLowerCase().includes('timeout')) {
+          errorMessage += '\n\nMögliche Ursachen:';
+          errorMessage += '\n- WASM-Dateien sind nicht unter /wasm/ erreichbar';
+          errorMessage += '\n- Falscher WASM-Pfad konfiguriert';
+          errorMessage += '\n- Browser unterstützt kein WebAssembly';
+          errorMessage += '\n- Setup() hängt und resolved nicht';
+        }
+      } else {
+        errorMessage += ': Unbekannter Fehler';
+      }
+      
+      throw new Error(errorMessage);
+    }
+      
+      // Configure web-ifc settings using loader.webIfc (direct property, not settings.webIfc)
+      // Use type assertion since these properties exist at runtime but may not be in type definitions
+      const webIfc = loader.webIfc as any;
+      webIfc.COORDINATE_TO_ORIGIN = true;
       // OPTIMIZE_PROFILES can be very slow for complex files - disable if performance is an issue
-      // @ts-ignore - OPTIMIZE_PROFILES missing in type definition but present in web-ifc
-      loader.settings.webIfc.OPTIMIZE_PROFILES = false;
+      webIfc.OPTIMIZE_PROFILES = false;
       
       // Performance optimizations
-      loader.settings.webIfc.MEMORY_LIMIT = 2 * 1024 * 1024 * 1024; // 2GB memory limit
-      // @ts-ignore - CIRCLE_SEGMENTS properties missing in type definition
-      loader.settings.webIfc.CIRCLE_SEGMENTS_LOW = 8;
-      // @ts-ignore
-      loader.settings.webIfc.CIRCLE_SEGMENTS_MEDIUM = 12;
-      // @ts-ignore
-      loader.settings.webIfc.CIRCLE_SEGMENTS_HIGH = 16;
+      webIfc.MEMORY_LIMIT = 2 * 1024 * 1024 * 1024; // 2GB memory limit
+      // CIRCLE_SEGMENTS properties missing in type definition
+      webIfc.CIRCLE_SEGMENTS_LOW = 8;
+      webIfc.CIRCLE_SEGMENTS_MEDIUM = 12;
+      webIfc.CIRCLE_SEGMENTS_HIGH = 16;
       
       // Additional performance settings
-      // @ts-ignore - USE_FAST_BOOLS missing in type definition
-      loader.settings.webIfc.USE_FAST_BOOLS = true;
+      webIfc.USE_FAST_BOOLS = true;
       
       // Additional optimizations for large/complex files (only if supported by web-ifc version)
       // These settings may not be available in all web-ifc versions, so we check first
       try {
         // Increase tape size for larger files (if supported)
-        if (typeof loader.settings.webIfc.TAPE_SIZE !== 'undefined') {
-          loader.settings.webIfc.TAPE_SIZE = 67108864; // 64MB tape size
+        if (typeof webIfc.TAPE_SIZE !== 'undefined') {
+          webIfc.TAPE_SIZE = 67108864; // 64MB tape size
         }
         // Enable memory manager if available
-        // @ts-ignore
-        if (typeof loader.settings.webIfc.MEMORY_MANAGER !== 'undefined') {
-          // @ts-ignore
-          loader.settings.webIfc.MEMORY_MANAGER = true;
+        if (typeof webIfc.MEMORY_MANAGER !== 'undefined') {
+          webIfc.MEMORY_MANAGER = true;
         }
         // Reduce logging overhead in production
-        // @ts-ignore
-        if (typeof loader.settings.webIfc.LOG_LEVEL !== 'undefined') {
-          // @ts-ignore
-          loader.settings.webIfc.LOG_LEVEL = 0; // 0 = no logging
+        if (typeof webIfc.LOG_LEVEL !== 'undefined') {
+          webIfc.LOG_LEVEL = 0; // 0 = no logging
         }
       } catch (e) {
         // Settings not available in this web-ifc version, continue with defaults
@@ -261,7 +359,7 @@
       }
       console.log('Loader configured and ready', {
         wasmPath: loader.settings.wasm?.path,
-        coordinateToOrigin: loader.settings.webIfc.COORDINATE_TO_ORIGIN
+        coordinateToOrigin: webIfc.COORDINATE_TO_ORIGIN
       });
   
       // Tools
@@ -335,8 +433,442 @@
       isLoading = false;
       engineInitialized = true;
     }
+
+    /**
+     * Unified IFC model loading function
+     * Handles loading IFC data from Uint8Array and adding to scene
+     * Follows ThatOpen Components best practices
+     */
+    async function loadIFCModel(data: Uint8Array, source: string, modelName?: string): Promise<any> {
+      // Validate loader is ready
+      if (!loader || !engineInitialized) {
+        throw new Error('Engine ist noch nicht initialisiert. Bitte warten Sie einen Moment.');
+      }
+
+      if (!loader || !loader.webIfc) {
+        throw new Error('Loader ist nicht korrekt initialisiert. Bitte laden Sie die Seite neu.');
+      }
+
+      // Validate data
+      if (!data || data.length === 0) {
+        throw new Error('IFC-Daten sind leer');
+      }
+
+      // Ensure data is Uint8Array
+      let dataToLoad = data;
+      if (!(dataToLoad instanceof Uint8Array)) {
+        console.warn('Data is not Uint8Array, converting...');
+        dataToLoad = new Uint8Array(dataToLoad);
+      }
+
+      // Validate IFC file header
+      const header = String.fromCharCode(...dataToLoad.slice(0, Math.min(100, dataToLoad.length)));
+      console.log('IFC file header check:', {
+        headerPreview: header.substring(0, 50),
+        startsWithISO: header.startsWith('ISO-10303-21'),
+        startsWithHEADER: header.startsWith('HEADER'),
+        firstBytes: Array.from(dataToLoad.slice(0, 20))
+      });
+      
+      if (!header.startsWith('ISO-10303-21') && !header.startsWith('HEADER')) {
+        console.warn('⚠️ File might not be a valid IFC file (header check failed)', {
+          headerPreview: header.substring(0, 100)
+        });
+      }
+
+      // Calculate timeout based on file size
+      const fileSizeMB = dataToLoad.length / 1024 / 1024;
+      let timeoutMs: number;
+      if (fileSizeMB < 1) {
+        timeoutMs = 30000; // 30s for small files
+      } else if (fileSizeMB < 10) {
+        timeoutMs = 60000; // 60s for medium files
+      } else {
+        timeoutMs = 120000; // 120s for large files
+      }
+
+      // Detailed loader state check
+      const loaderState = {
+        loaderExists: !!loader,
+        loaderType: loader?.constructor?.name,
+        hasSettings: !!loader?.settings,
+        hasWebIfc: !!loader?.webIfc,
+        wasmPath: loader?.settings?.wasm?.path,
+        coordinateToOrigin: (loader?.webIfc as any)?.COORDINATE_TO_ORIGIN,
+        webIfcType: loader?.webIfc?.constructor?.name
+      };
+
+      console.log('🔍 Starting IFC loader with detailed state...', {
+        source,
+        dataSize: `${fileSizeMB.toFixed(2)} MB`,
+        dataLength: dataToLoad.length,
+        timeout: `${timeoutMs / 1000}s`,
+        engineInitialized,
+        loaderState,
+        fragmentsManager: {
+          exists: !!fragments,
+          type: fragments?.constructor?.name
+        }
+      });
+
+      // Additional validation: Check if web-ifc is properly initialized
+      if (!loader?.webIfc) {
+        throw new Error('web-ifc is not initialized. Loader setup may have failed.');
+      }
+
+      // Log web-ifc internal state if available - CRITICAL DIAGNOSTICS
+      // Use loader.webIfc (direct property) for consistency
+      try {
+        const webIfc = loader.webIfc;
+        
+        // Verify webIfc type consistency
+        const webIfcType = webIfc?.constructor?.name;
+        console.log('🔍 web-ifc type check:', {
+          type: webIfcType,
+          expected: 'IfcAPI2',
+          isCorrect: webIfcType === 'IfcAPI2' || webIfcType === 'IfcAPI',
+          usingDirectProperty: true
+        });
+        
+        // Check if WASM is actually loaded
+        const wasmLoaded = !!(webIfc as any).wasm || !!(webIfc as any).Module || !!(webIfc as any).HEAP8;
+        
+        // Get all available properties/methods
+        const webIfcKeys = Object.keys(webIfc || {}).slice(0, 20);
+        const webIfcPrototypeKeys = Object.getOwnPropertyNames(Object.getPrototypeOf(webIfc || {})).slice(0, 20);
+        
+        // Check for common web-ifc API patterns
+        const apiChecks = {
+          hasOpen: typeof (webIfc as any).Open === 'function',
+          hasClose: typeof (webIfc as any).Close === 'function',
+          hasLoadModel: typeof (webIfc as any).LoadModel === 'function',
+          hasOpenModel: typeof (webIfc as any).OpenModel === 'function',
+          hasCloseModel: typeof (webIfc as any).CloseModel === 'function',
+          hasGetLine: typeof (webIfc as any).GetLine === 'function',
+          hasGetLineIDWithType: typeof (webIfc as any).GetLineIDWithType === 'function',
+          hasWasm: wasmLoaded,
+          hasModule: !!(webIfc as any).Module,
+          hasHEAP8: !!(webIfc as any).HEAP8,
+          hasHEAP32: !!(webIfc as any).HEAP32,
+          memoryLimit: (webIfc as any).MEMORY_LIMIT,
+          coordinateToOrigin: (webIfc as any).COORDINATE_TO_ORIGIN,
+          type: webIfcType,
+          keys: webIfcKeys,
+          prototypeKeys: webIfcPrototypeKeys
+        };
+        
+        console.log('🔍 web-ifc detailed state:', apiChecks);
+        
+        // CRITICAL: Check if WASM is actually loaded
+        if (!wasmLoaded && !apiChecks.hasOpen && !apiChecks.hasOpenModel) {
+          console.error('❌ CRITICAL: web-ifc WASM appears to NOT be loaded!', {
+            webIfcType: webIfcType,
+            hasWasm: wasmLoaded,
+            availableKeys: webIfcKeys,
+            wasmPath: loader.settings.wasm?.path,
+            note: 'Using loader.webIfc (direct property) - should be IfcAPI2 type'
+          });
+          
+          // Try to check if WASM file exists
+          fetch(loader.settings.wasm?.path + 'web-ifc.wasm', { method: 'HEAD' })
+            .then(res => {
+              console.log('🔍 WASM file check:', {
+                exists: res.ok,
+                status: res.status,
+                url: loader.settings.wasm?.path + 'web-ifc.wasm'
+              });
+            })
+            .catch(err => {
+              console.error('❌ WASM file check failed:', err);
+            });
+        } else {
+          console.log('✅ web-ifc is properly initialized with WASM functions available');
+        }
+        
+        // Check if loader has internal web-ifc reference
+        const loaderInternal = (loader as any);
+        console.log('🔍 Loader internal state:', {
+          hasWebIfc: !!loaderInternal.webIfc,
+          hasIfcAPI: !!loaderInternal.ifcAPI,
+          loaderMethods: Object.getOwnPropertyNames(loaderInternal).filter(k => typeof loaderInternal[k] === 'function').slice(0, 10)
+        });
+        
+      } catch (e) {
+        console.error('❌ Could not inspect web-ifc state:', e);
+      }
+
+      // Create abort controller for timeout
+      const controller = new AbortController();
+      
+      // Create loading promise
+      const loadPromise = new Promise<any>(async (resolve, reject) => {
+        try {
+          const startTime = performance.now();
+          
+          // Progress tracking with more details
+          const progressInterval = setInterval(() => {
+            const elapsed = ((performance.now() - startTime) / 1000).toFixed(1);
+            const memoryUsage = (performance as any).memory ? {
+              used: `${((performance as any).memory.usedJSHeapSize / 1024 / 1024).toFixed(2)} MB`,
+              total: `${((performance as any).memory.totalJSHeapSize / 1024 / 1024).toFixed(2)} MB`
+            } : 'N/A';
+            
+            console.log(`⏳ Loader processing... ${elapsed}s elapsed`, {
+              aborted: controller.signal.aborted,
+              memoryUsage,
+              dataSize: `${fileSizeMB.toFixed(2)} MB`,
+              loaderState: loader?.constructor?.name
+            });
+          }, 2000);
+
+          try {
+            // FINAL CHECK before calling load - verify web-ifc is actually ready
+            const webIfcReady = loader.webIfc;
+            const hasWasm = !!(webIfcReady as any).wasm || !!(webIfcReady as any).Module || !!(webIfcReady as any).HEAP8;
+            const hasAnyFunction = typeof (webIfcReady as any).Open === 'function' || 
+                                   typeof (webIfcReady as any).OpenModel === 'function' ||
+                                   typeof (webIfcReady as any).GetLine === 'function';
+            
+            console.log('🚀 Calling loader.load()...', {
+              dataLength: dataToLoad.length,
+              dataType: dataToLoad.constructor.name,
+              loaderType: loader.constructor.name,
+              timestamp: new Date().toISOString(),
+              webIfcReady: {
+                exists: !!webIfcReady,
+                hasWasm: hasWasm,
+                hasAnyFunction: hasAnyFunction,
+                type: webIfcReady?.constructor?.name
+              }
+            });
+            
+            // WARNING if web-ifc doesn't seem ready
+            if (!hasWasm && !hasAnyFunction) {
+              console.error('⚠️ WARNING: web-ifc may not be fully initialized before load() call!', {
+                webIfcType: webIfcReady?.constructor?.name,
+                hasWasm: hasWasm,
+                hasAnyFunction: hasAnyFunction
+              });
+            }
+            
+            // Load model using ThatOpen Components
+            // API: load(data: Uint8Array, coordinate: boolean, name: string, config?: object)
+            const loadStartTime = performance.now();
+            console.log('⏱️ Starting loader.load() at:', new Date().toISOString());
+            
+            // Wrap in try-catch to catch any synchronous errors
+            let model;
+            try {
+              model = await loader.load(
+                dataToLoad,
+                true, // coordinate: true (default)
+                modelName || "model", // name for the fragments model
+                {
+                  processData: {
+                    progressCallback: (progress) => {
+                      // Optional: log progress if needed
+                      if (progress % 10 === 0) {
+                        console.log(`IFC loading progress: ${progress}%`);
+                      }
+                    }
+                  }
+                }
+              );
+            } catch (syncError) {
+              console.error('❌ Synchronous error in loader.load():', syncError);
+              throw syncError;
+            }
+            const loadDuration = ((performance.now() - loadStartTime) / 1000).toFixed(2);
+            
+            console.log(`✅ loader.load() completed in ${loadDuration}s`, {
+              modelType: model?.constructor?.name,
+              modelUuid: (model as any)?.uuid,
+              hasGeometry: !!(model as any)?.geometry
+            });
+            
+            clearInterval(progressInterval);
+            
+            if (controller.signal.aborted) {
+              reject(new Error('Load was aborted'));
+              return;
+            }
+
+            if (!model) {
+              throw new Error('Loader returned null/undefined model');
+            }
+
+            const duration = ((performance.now() - startTime) / 1000).toFixed(2);
+            console.log(`Loader completed in ${duration} seconds`, {
+              modelType: model?.constructor?.name,
+              modelUuid: (model as any)?.uuid
+            });
+
+            resolve(model);
+          } catch (loadErr) {
+            clearInterval(progressInterval);
+            const elapsed = ((performance.now() - startTime) / 1000).toFixed(2);
+            
+            // Enhanced error logging
+            const errorDetails: any = {
+              error: loadErr,
+              message: loadErr instanceof Error ? loadErr.message : String(loadErr),
+              elapsedTime: `${elapsed}s`,
+              dataSize: `${fileSizeMB.toFixed(2)} MB`,
+              dataLength: dataToLoad.length,
+              loaderType: loader?.constructor?.name,
+              aborted: controller.signal.aborted
+            };
+            
+            // Add stack trace if available
+            if (loadErr instanceof Error && loadErr.stack) {
+              errorDetails.stack = loadErr.stack;
+            }
+            
+            // Check if it's a WebAssembly error
+            if (loadErr instanceof Error) {
+              const errorMsg = loadErr.message.toLowerCase();
+              if (errorMsg.includes('wasm') || errorMsg.includes('webassembly')) {
+                errorDetails.errorType = 'WebAssembly Error';
+                console.error('❌ WebAssembly-related error detected:', errorDetails);
+              } else if (errorMsg.includes('memory') || errorMsg.includes('out of memory')) {
+                errorDetails.errorType = 'Memory Error';
+                console.error('❌ Memory error detected:', errorDetails);
+              } else {
+                console.error('❌ Loader.load() error:', errorDetails);
+              }
+            } else {
+              console.error('❌ Loader.load() error (non-Error object):', errorDetails);
+            }
+            
+            reject(loadErr);
+          }
+        } catch (error) {
+          console.error('Load promise error:', error);
+          reject(error);
+        }
+      });
+
+      // Create timeout promise with detailed error
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        const timeoutId = setTimeout(() => {
+          console.error('⏰ Loader timeout triggered!', {
+            timeout: `${timeoutMs / 1000}s`,
+            dataSize: `${fileSizeMB.toFixed(2)} MB`,
+            source,
+            loaderState: {
+              type: loader?.constructor?.name,
+              hasSettings: !!loader?.settings,
+              hasWebIfc: !!loader?.settings?.webIfc
+            },
+            timestamp: new Date().toISOString()
+          });
+          
+          controller.abort();
+          
+          // Provide more helpful error message based on file size
+          let errorMessage = `Loader timeout: Das Laden hat zu lange gedauert (${timeoutMs / 1000}s).`;
+          if (fileSizeMB < 1) {
+            errorMessage += ' Diese kleine Datei sollte normalerweise schnell laden. Möglicherweise ist die Datei korrupt oder das Format nicht unterstützt.';
+          } else {
+            errorMessage += ' Bitte versuchen Sie eine kleinere Datei oder laden Sie die Seite neu.';
+          }
+          
+          reject(new Error(errorMessage));
+        }, timeoutMs);
+        // Cleanup timeout if load completes first
+        loadPromise.finally(() => clearTimeout(timeoutId));
+      });
+
+      // Race between load and timeout
+      const model = await Promise.race([loadPromise, timeoutPromise]);
+
+      // Set model name
+      if (modelName) {
+        (model as any).name = modelName;
+      }
+
+      // Clear previous models
+      clearPreviousModels();
+
+      // loader.load() returns a FragmentsGroup (t6 type)
+      // According to ThatOpen API, we need to use model.object for the THREE.Object3D
+      // and register it with the FragmentsManager
+      const modelObject = (model as any).object || model;
+      
+      // Ensure model is registered with FragmentsManager and uses camera
+      if (model && typeof (model as any).useCamera === 'function' && world.camera) {
+        (model as any).useCamera(world.camera.three);
+      }
+      
+      // Add model.object to scene (not model directly)
+      if (modelObject && modelObject instanceof THREE.Object3D) {
+        world.scene.three.add(modelObject);
+        models.push(model);
+        console.log('Model added to scene via model.object');
+      } else {
+        // Fallback: try adding model directly if object property doesn't exist
+        world.scene.three.add(model as any);
+        models.push(model);
+        console.log('Model added to scene directly (fallback)');
+      }
+      
+      // Update fragments core after adding model
+      if (fragments && (fragments as any).core) {
+        (fragments as any).core.update(true);
+      }
+
+      // Apply transformations and build tree
+      loadingText = "Berechne Position...";
+      applyGlobalShift(modelObject);
+
+      loadingText = "Erstelle Struktur...";
+      await updateTree(model);
+
+      loadingText = "Passe Ansicht an...";
+      fitModel();
+
+      return model;
+    }
+
+    /**
+     * Clear previous models from scene
+     */
+    function clearPreviousModels() {
+      // @ts-ignore - groups property missing in FragmentsManager type definition
+      if (fragments?.groups?.size) {
+        // @ts-ignore
+        for (const group of fragments.groups.values()) {
+          world.scene.three.remove(group);
+        }
+        // @ts-ignore
+        fragments.groups.clear?.();
+        // @ts-ignore
+        fragments.list?.clear?.();
+        treeData = [];
+        models = [];
+        globalYShift = null;
+        // Re-init fragments manager if available
+        if (typeof (fragments as any).init === 'function') {
+          try { (fragments as any).init(); } catch {}
+        }
+      }
+    }
+
+    /**
+     * Extract file path from Supabase storage URL
+     */
+    function extractFilePathFromUrl(url: string): string {
+      const storagePrefix = '/storage/v1/object/public/bim-files/';
+      const prefixIndex = url.indexOf(storagePrefix);
+      if (prefixIndex !== -1) {
+        return url.substring(prefixIndex + storagePrefix.length);
+      }
+      // Fallback: extract filename and assume public/ prefix
+      const fileName = url.split('/').pop() || '';
+      return `public/${fileName}`;
+    }
   
-    async function loadModelFromUrl(url: string) {
+async function loadModelFromUrl(url: string, token?: number) {
       isLoading = true;
       loadingText = "Lade Modell von URL...";
       try {
@@ -346,18 +878,7 @@
         // If public URL fails (400/403), try to get a signed URL from backend
         if (!response.ok && (response.status === 400 || response.status === 403)) {
           console.log('Public URL failed, requesting signed download URL...');
-          // Extract file_path from URL - remove the Supabase storage URL prefix
-          // URL format: https://xxx.supabase.co/storage/v1/object/public/bim-files/public/filename.ifc
-          // We need: public/filename.ifc
-          let filePath = url;
-          const storagePrefix = '/storage/v1/object/public/bim-files/';
-          const prefixIndex = url.indexOf(storagePrefix);
-          if (prefixIndex !== -1) {
-            filePath = url.substring(prefixIndex + storagePrefix.length);
-          } else {
-            // Fallback: just get filename
-            filePath = `public/${url.split('/').pop() || ''}`;
-          }
+          const filePath = extractFilePathFromUrl(url);
           
           loadingText = "Fordere Download-URL an...";
           
@@ -402,181 +923,33 @@
           throw new Error('Downloaded file is empty');
         }
         
-        // Create a fresh Uint8Array from the buffer
+        // Create Uint8Array from buffer
         const data = new Uint8Array(buffer);
-        console.log('Data array created:', {
-          length: data.length,
-          byteLength: data.byteLength,
-          firstBytes: Array.from(data.slice(0, 20))
-        });
         
-        // Clear existing models before loading a new one
-        // @ts-ignore - groups property missing in FragmentsManager type definition
-        if (fragments && fragments.groups && fragments.groups.size > 0) {
-            console.log('Clearing existing models...');
-            fragments.dispose();
-            treeData = [];
-            models = [];
-            globalYShift = null;
+        // Abort if a newer load was requested
+        if (token && token !== loadToken) {
+          console.log('Stale model load discarded', { url });
+          return;
         }
 
-        // Ensure loader is ready
-        if (!loader || !engineInitialized) {
-          throw new Error('Engine ist noch nicht initialisiert. Bitte warten Sie einen Moment.');
-        }
-
-        loadingText = "Lade IFC Modell (dies kann einige Minuten dauern)...";
-        console.log('Starting IFC loader...', { 
-          dataSize: data.length, 
-          loaderReady: !!loader,
-          engineInitialized,
-          loaderSettings: loader?.settings
-        });
-
-        // Check if loader is properly initialized
-        if (!loader || !loader.settings) {
-          throw new Error('Loader ist nicht korrekt initialisiert. Bitte laden Sie die Seite neu.');
-        }
-
-        // Set a timeout to show we're still working and catch hangs
-        const loadingTimeout = setTimeout(() => {
-          if (isLoading) {
-            loadingText = `Lädt immer noch... Das kann bei großen IFC-Dateien einige Minuten dauern.`;
-            console.log('Loader still running after 5 seconds...', {
-              dataLength: data.length,
-              loaderState: loader
-            });
-          }
-        }, 5000); // After 5 seconds
-
-        // Add another timeout for 30 seconds to show more detailed message
-        const longLoadingTimeout = setTimeout(() => {
-          if (isLoading) {
-            loadingText = `Lädt... Dies kann bei komplexen IFC-Dateien bis zu 2 Minuten dauern.`;
-            console.warn('Loader taking longer than expected (30+ seconds)', {
-              dataSize: `${(data.length / 1024 / 1024).toFixed(2)} MB`
-            });
-          }
-        }, 30000); // After 30 seconds
-
-        // Create a wrapper promise to add logging
-        // Also ensure data is in the correct format
-        const loadPromise = new Promise(async (resolve, reject) => {
-          try {
-            console.log('Calling loader.load()...', {
-              dataType: data.constructor.name,
-              dataLength: data.length,
-              dataByteLength: data.byteLength,
-              loaderType: loader.constructor.name,
-              loaderReady: !!loader,
-              hasLoaderSettings: !!loader?.settings
-            });
-            
-            // Ensure data is a proper Uint8Array
-            let dataToLoad = data;
-            if (!(dataToLoad instanceof Uint8Array)) {
-              console.warn('Data is not Uint8Array, converting...');
-              dataToLoad = new Uint8Array(dataToLoad);
-            }
-            
-            // Log IFC file header to verify it's a valid IFC file
-            const header = String.fromCharCode(...dataToLoad.slice(0, Math.min(100, dataToLoad.length)));
-            console.log('IFC file header preview:', header.substring(0, 100));
-            if (!header.startsWith('ISO-10303-21') && !header.startsWith('HEADER')) {
-              console.warn('File might not be a valid IFC file (header check)');
-            }
-            
-            const startTime = performance.now();
-            
-            // Add a progress check every 2 seconds
-            let progressCheckInterval: ReturnType<typeof setInterval> | null = null;
-            let lastProgressTime = startTime;
-            
-            progressCheckInterval = setInterval(() => {
-              const currentTime = performance.now();
-              const elapsed = ((currentTime - startTime) / 1000).toFixed(1);
-              console.log(`Loader still processing... ${elapsed}s elapsed`);
-              lastProgressTime = currentTime;
-            }, 2000);
-            
-            try {
-              const model = await loader.load(dataToLoad);
-              if (progressCheckInterval) clearInterval(progressCheckInterval);
-              
-              const endTime = performance.now();
-              const duration = ((endTime - startTime) / 1000).toFixed(2);
-              
-              console.log(`Loader completed in ${duration} seconds`, {
-                model: model,
-                modelType: model?.constructor?.name,
-                // @ts-ignore - geometry property missing in FragmentsModel type definition
-                hasGeometry: !!model?.geometry,
-                modelKeys: model ? Object.keys(model).slice(0, 10) : []
-              });
-              
-              resolve(model);
-            } catch (loadErr) {
-              if (progressCheckInterval) clearInterval(progressCheckInterval);
-              throw loadErr;
-            }
-          } catch (error) {
-            console.error('Loader.load() threw an error:', error);
-            console.error('Error stack:', error instanceof Error ? error.stack : 'No stack');
-            reject(error);
-          }
-        });
+        loadingText = "Lade IFC Modell...";
         
-        const timeoutPromise = new Promise((_, reject) => {
-          setTimeout(() => {
-            reject(new Error('Loader timeout: Das Laden hat zu lange gedauert. Bitte versuchen Sie eine kleinere Datei oder laden Sie die Seite neu.'));
-          }, 120000); // 120 second timeout (2 minutes for larger files)
-        });
-
-        try {
-          const model = await Promise.race([loadPromise, timeoutPromise]) as any;
-          clearTimeout(loadingTimeout);
-          clearTimeout(longLoadingTimeout);
-          console.log('IFC model loaded successfully', model);
-          
-          const fileName = url.split('/').pop() || "Modell";
-          model.name = fileName;
-
-          loadingText = "Füge Modell zur Szene hinzu...";
-          world.scene.three.add(model);
-          models.push(model);
-          
-          loadingText = "Berechne Position...";
-          applyGlobalShift(model);
-          
-          loadingText = "Erstelle Struktur...";
-          await updateTree(model);
-
-          loadingText = "Passe Ansicht an...";
-          fitModel();
-          
-          loadingText = "Modell geladen!";
-          console.log('Model successfully added to scene');
-        } catch (loadError) {
-          clearTimeout(loadingTimeout);
-          clearTimeout(longLoadingTimeout);
-          console.error('Loader error details:', {
-            error: loadError,
-            message: loadError instanceof Error ? loadError.message : String(loadError),
-            stack: loadError instanceof Error ? loadError.stack : undefined,
-            dataSize: data.length,
-            loaderState: {
-              initialized: !!loader,
-              settings: loader?.settings
-            }
-          });
-          throw loadError;
-        }
-
+        // Extract model name from URL
+        const fileName = url.split('/').pop() || "Modell";
+        
+        // Use unified loader function
+        await loadIFCModel(data, `URL: ${url}`, fileName);
+        
+        loadingText = "Modell geladen!";
+        console.log('Model successfully loaded from URL');
       } catch (err) {
-        console.error(err);
-        alert(`Fehler beim Laden des Modells von URL: ${err instanceof Error ? err.message : 'Unbekannter Fehler'}`);
+        console.error('Error loading model from URL:', err);
+        loadingText = `Fehler beim Laden: ${err instanceof Error ? err.message : 'Unbekannter Fehler'}`;
+        throw err;
       } finally {
-        isLoading = false;
+        if (!token || token === loadToken) {
+          isLoading = false;
+        }
       }
     }
   
@@ -645,197 +1018,17 @@
 
           loadingText = `Verarbeite ${file.name}...`;
 
-          // 3. (For now) Load the model from the uploaded file buffer to keep viewer working
-          // In the future, we'll load it from a Supabase URL
+          // Load the model from the uploaded file buffer
           const buffer = await file.arrayBuffer();
           const data = new Uint8Array(buffer);
           
           loadingText = `Lade IFC Modell ${file.name} (${(file.size / 1024 / 1024).toFixed(2)} MB)...`;
           
-          // Ensure loader is ready and properly initialized
-          if (!loader || !engineInitialized) {
-            throw new Error('Engine ist noch nicht initialisiert. Bitte warten Sie einen Moment.');
-          }
+          // Use unified loader function
+          await loadIFCModel(data, `File upload: ${file.name}`, file.name);
           
-          // Double-check loader is ready
-          if (!loader.settings || !loader.settings.webIfc) {
-            throw new Error('Loader ist nicht korrekt konfiguriert. Bitte laden Sie die Seite neu.');
-          }
-          
-          // Clear existing models before loading a new one
-          // @ts-ignore - groups property missing in FragmentsManager type definition
-          if (fragments && fragments.groups && fragments.groups.size > 0) {
-            console.log('Clearing existing models before loading new file...');
-            fragments.dispose();
-            treeData = [];
-            models = [];
-            globalYShift = null;
-          }
-          
-          // Load the IFC model - this can take a while for large files
-          // The loader uses WebAssembly which may take time for large files
-          console.log(`Starting to load IFC file: ${file.name}, size: ${(file.size / 1024 / 1024).toFixed(2)} MB`);
-          console.log('Loader state:', { 
-            loader: !!loader, 
-            settings: !!loader?.settings,
-            webIfc: !!loader?.settings?.webIfc,
-            wasmPath: loader?.settings?.wasm?.path,
-            coordinateToOrigin: loader?.settings?.webIfc?.COORDINATE_TO_ORIGIN
-          });
-          
-          // Set a timeout to show we're still working and catch hangs
-          const loadingTimeout = setTimeout(() => {
-            if (isLoading) {
-              loadingText = `Lädt immer noch... Das kann bei großen IFC-Dateien einige Minuten dauern.`;
-            }
-          }, 5000); // After 5 seconds
-          
-          // Add another timeout for 30 seconds to show more detailed message
-          const longLoadingTimeout = setTimeout(() => {
-            if (isLoading) {
-              loadingText = `Lädt... Dies kann bei komplexen IFC-Dateien bis zu 2 Minuten dauern.`;
-              console.warn('Loader taking longer than expected (30+ seconds)', {
-                dataSize: `${(file.size / 1024 / 1024).toFixed(2)} MB`
-              });
-            }
-          }, 30000); // After 30 seconds
-          
-          // Create a wrapper promise to add logging and progress tracking
-          const loadPromise = new Promise(async (resolve, reject) => {
-            try {
-              console.log('Calling loader.load()...', {
-                fileName: file.name,
-                dataType: data.constructor.name,
-                dataLength: data.length,
-                dataByteLength: data.byteLength,
-                loaderType: loader.constructor.name,
-                loaderReady: !!loader,
-                hasLoaderSettings: !!loader?.settings
-              });
-              
-              // Ensure data is a proper Uint8Array
-              let dataToLoad = data;
-              if (!(dataToLoad instanceof Uint8Array)) {
-                console.warn('Data is not Uint8Array, converting...');
-                dataToLoad = new Uint8Array(dataToLoad);
-              }
-              
-              // Log IFC file header to verify it's a valid IFC file
-              const header = String.fromCharCode(...dataToLoad.slice(0, Math.min(100, dataToLoad.length)));
-              console.log('IFC file header preview:', header.substring(0, 100));
-              if (!header.startsWith('ISO-10303-21') && !header.startsWith('HEADER')) {
-                console.warn('File might not be a valid IFC file (header check)');
-              }
-              
-              const startTime = performance.now();
-              
-              // Add a progress check every 2 seconds
-              let progressCheckInterval: ReturnType<typeof setInterval> | null = null;
-              
-              progressCheckInterval = setInterval(() => {
-                const currentTime = performance.now();
-                const elapsed = ((currentTime - startTime) / 1000).toFixed(1);
-                console.log(`Loader still processing... ${elapsed}s elapsed`);
-              }, 2000);
-              
-              try {
-                // For bSDD sample files, loading should be fast - add extra validation
-                console.log('Starting loader.load() call...', {
-                  dataSize: `${(dataToLoad.length / 1024 / 1024).toFixed(2)} MB`,
-                  loaderReady: !!loader,
-                  hasSettings: !!loader?.settings,
-                  wasmPath: loader?.settings?.wasm?.path,
-                  webIfcReady: !!loader?.settings?.webIfc
-                });
-                
-                // Add a warning if loading takes too long for small files
-                const loadStartTime = performance.now();
-                const smallFileThreshold = 1 * 1024 * 1024; // 1MB
-                if (dataToLoad.length < smallFileThreshold) {
-                  console.log(`Small file detected (${(dataToLoad.length / 1024).toFixed(2)} KB), should load quickly...`);
-                }
-                
-                const model = await loader.load(dataToLoad);
-                
-                if (progressCheckInterval) clearInterval(progressCheckInterval);
-                
-                const endTime = performance.now();
-                const duration = ((endTime - startTime) / 1000).toFixed(2);
-                
-                // Validate model was loaded correctly
-                if (!model) {
-                  throw new Error('Loader returned null/undefined model');
-                }
-                
-                console.log(`Loader completed in ${duration} seconds`, {
-                  model: model,
-                  modelType: model?.constructor?.name,
-                  // @ts-ignore - geometry property missing in FragmentsModel type definition
-                  hasGeometry: !!model?.geometry,
-                  modelKeys: model ? Object.keys(model).slice(0, 10) : [],
-                  // @ts-ignore - uuid property missing in FragmentsModel type definition
-                  modelUuid: model?.uuid
-                });
-                
-                resolve(model);
-              } catch (loadErr) {
-                if (progressCheckInterval) clearInterval(progressCheckInterval);
-                
-                // Enhanced error logging for debugging
-                console.error('Loader.load() error:', {
-                  error: loadErr,
-                  message: loadErr instanceof Error ? loadErr.message : String(loadErr),
-                  stack: loadErr instanceof Error ? loadErr.stack : undefined,
-                  dataSize: `${(dataToLoad.length / 1024 / 1024).toFixed(2)} MB`,
-                  elapsedTime: `${((performance.now() - startTime) / 1000).toFixed(2)}s`
-                });
-                
-                throw loadErr;
-              }
-            } catch (error) {
-              console.error('Loader.load() threw an error:', error);
-              console.error('Error stack:', error instanceof Error ? error.stack : 'No stack');
-              reject(error);
-            }
-          });
-          
-          // Create a timeout promise to detect if loader hangs
-          // Increased to 120 seconds to match URL loading timeout
-          const timeoutPromise = new Promise((_, reject) => {
-            setTimeout(() => {
-              reject(new Error('Loader timeout: Das Laden hat zu lange gedauert. Bitte versuchen Sie eine kleinere Datei oder laden Sie die Seite neu.'));
-            }, 120000); // 120 second timeout (2 minutes for larger files)
-          });
-          
-          try {
-            const model = await Promise.race([loadPromise, timeoutPromise]) as any;
-            clearTimeout(loadingTimeout);
-            clearTimeout(longLoadingTimeout);
-            console.log('IFC model loaded successfully', model);
-          model.name = file.name;
-          
-          loadingText = `Füge Modell zur Szene hinzu...`;
-          world.scene.three.add(model);
-          models.push(model);
-          
-          loadingText = `Berechne Position...`;
-          applyGlobalShift(model);
-          
-          loadingText = `Erstelle Struktur...`;
-          await updateTree(model);
-          
-            atLeastOneSuccess = true;
-            loadingText = `Modell geladen!`;
-          } catch (loadError) {
-            clearTimeout(loadingTimeout);
-            clearTimeout(longLoadingTimeout);
-            console.error('Loader error details:', {
-              error: loadError,
-              message: loadError instanceof Error ? loadError.message : String(loadError),
-              stack: loadError instanceof Error ? loadError.stack : undefined
-            });
-            throw loadError;
-          }
+          atLeastOneSuccess = true;
+          loadingText = `Modell geladen!`;
 
         } catch (err) {
           console.error('Upload/Processing Error:', err);
@@ -845,7 +1038,7 @@
             stack: err instanceof Error ? err.stack : undefined
           });
           const errorMsg = err instanceof Error ? err.message : 'Unbekannter Fehler';
-          alert(`Fehler beim Hochladen/Verarbeiten von ${file.name}: ${errorMsg}`);
+          loadingText = `Fehler beim Hochladen/Verarbeiten von ${file.name}: ${errorMsg}`;
           // Reset loading state on error
           isLoading = false;
         }
@@ -860,8 +1053,21 @@
     }
   
     function applyGlobalShift(model: any) {
-      model.updateMatrixWorld(true);
-      const bbox = new THREE.Box3().setFromObject(model);
+      // Handle FragmentsGroup: use model.object if available
+      const targetObject = (model && (model as any).object) ? (model as any).object : model;
+      
+      // Ensure targetObject is a THREE.Object3D
+      if (!targetObject || typeof targetObject.updateMatrixWorld !== 'function') {
+        console.warn('applyGlobalShift: model does not have updateMatrixWorld method', {
+          modelType: model?.constructor?.name,
+          hasObject: !!(model as any)?.object,
+          objectType: (model as any)?.object?.constructor?.name
+        });
+        return;
+      }
+      
+      targetObject.updateMatrixWorld(true);
+      const bbox = new THREE.Box3().setFromObject(targetObject);
       const minY = bbox.min.y;
   
       if (Number.isFinite(minY)) {
@@ -870,8 +1076,8 @@
               console.log(`Globaler Shift gesetzt: ${globalYShift}`);
           }
           if (globalYShift !== 0) {
-              model.position.y += globalYShift;
-              model.updateMatrixWorld(true);
+              targetObject.position.y += globalYShift;
+              targetObject.updateMatrixWorld(true);
           }
       }
     }
@@ -1012,7 +1218,7 @@
       if (e.code === 'Escape') setTool('select');
     }
   
-    function toggleVisibility(item: TreeItem) {
+    async function toggleVisibility(item: TreeItem) {
       if (item.type === 'category' && item.categoryId) {
           const isVisible = !item.visible;
           // Toggle Logic in Tree Data
@@ -1021,15 +1227,14 @@
           treeData = [...treeData];
   
           // Apply to Fragments
-          const found = classifier.find({ entities: [item.categoryId] });
+          // classifier.find() returns a Promise, so we need to await it
+          const found = await classifier.find({ entities: [item.categoryId] });
           for (const fragID in found) {
               const fragment = fragments.list.get(fragID);
               if (fragment) {
                   const ids = found[fragID];
-                  // @ts-ignore - setVisibility missing in Fragment type definition, likely setVisible
-                  if (typeof fragment.setVisibility === 'function') {
-                    fragment.setVisibility(isVisible, ids);
-                  } else if (typeof (fragment as any).setVisible === 'function') {
+                  // Use setVisible (correct API) instead of setVisibility
+                  if (typeof (fragment as any).setVisible === 'function') {
                     (fragment as any).setVisible(isVisible, ids);
                   }
               }
