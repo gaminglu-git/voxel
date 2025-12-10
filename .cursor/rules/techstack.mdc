@@ -3,23 +3,35 @@ alwaysApply: true
 ---
 Tech Stack Guidelines
 
-Frontend: SvelteKit + Skeleton UI
+Frontend: SvelteKit + Shadcn-Svelte (with Bits UI)
 
 Svelte Components:
 
 Use <script lang="ts">.
 
+Use Svelte 5 Runes for reactivity:
+- Props: `let { prop } = $props()` or `let { prop = $props().prop ?? defaultValue }`
+- State: `let variable = $state(value)`
+- Derived: `let derived = $derived(...)`
+- Effects: `$effect(() => { ... })`
+
+Use Context API for global state (User session) instead of Stores.
+
 Use bind:this={element} instead of document.getElementById().
 
-Use Svelte Stores for global state (User session, current Model ID).
-
 Components must be reactive. Avoid direct DOM manipulation outside of onMount.
+
+Event handling: Use callback props instead of createEventDispatcher:
+- `let { onSelect } = $props<{ onSelect?: (event: { url: string }) => void }>()`
+- Call with: `onSelect?.({ url })`
 
 Styling:
 
 Use Tailwind CSS utility classes.
 
-Use Skeleton UI components (AppBar, AppShell) for layout structure.
+Use Shadcn-Svelte components (Button, Card, Input, Label, Alert, etc.) from `$lib/components/ui/`.
+
+Use Bits UI components (Sheet, Collapsible, Separator) for layout structure.
 
 Keep CSS in <style> blocks only for specific 3D-Canvas overlays that Tailwind cannot reach easily.
 

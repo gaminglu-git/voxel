@@ -4,6 +4,22 @@ alwaysApply: false
 ---
 ThatOpen Framework Guidelines (BIM Engine)
 
+## ⚠️ CRITICAL: Version Changes
+
+**BEFORE making ANY changes to versions of `web-ifc`, `@thatopen/*` packages, `three.js`, or related Three.js libraries, you MUST:**
+
+1. **Read the ThatOpen Migration Guide**: https://docs.thatopen.com/migration
+2. **Check version compatibility**: All ThatOpen packages and their peer dependencies (especially `web-ifc` and `three.js`) must be compatible
+3. **Verify peer dependency requirements**: Check `package-lock.json` for the required versions (e.g., `web-ifc >= 0.0.72` for ThatOpen Components 3.2.x)
+4. **Update WASM path**: If `web-ifc` version changes, update the WASM path in loader configuration to match the new version
+5. **Never mix old and new library versions**: All ThatOpen packages must be upgraded together
+
+**Key Points from Migration Docs:**
+- All versions of the library should use the same `web-ifc` version
+- You can't combine old and new libraries
+- Check peer dependencies (watch out for `three.js` version requirements)
+- The correct `web-ifc` version can be found in the migration guide and in `package-lock.json` peer dependencies
+
 Core Principles
 
 The application uses @thatopen/components (Engine) and @thatopen/ui (Web Components).
